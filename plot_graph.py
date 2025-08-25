@@ -1,39 +1,38 @@
-# Utility: visualize a single NeighborLoader batch with seed event/firm centered between rows
+# Updated visualization: place seed firm slightly above seed event (no overlap)
 # - Events: y=0
 # - Firms : y=1
-# - Seed event(s) and its seed firm(s): y=seed_y (default 0.5)
+# - Seed event(s): y=seed_y
+# - Seed firm(s) : y=seed_y + seed_gap
 #
-# Requirements: networkx, matplotlib
-# Notes: no explicit colors are set; different line styles distinguish relations.
+# Edge styles only (no colors), seeds labeled.
 
 import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
 
-def visualize_batch_centered(batch, seed_y=0.5, save_png=None, save_graphml=None):
+def visualize_batch_centered_offset(batch, seed_y=0.5, seed_gap=0.12, save_png=None, save_graphml=None):
     """
-    Visualize a hetero NeighborLoader batch (ideally batch_size=1).
-    - Places events on y=0 (x by time rank).
-    - Places firms on y=1 (x ≈ mean of adjacent events).
-    - Places seed event(s) and seed firm(s) at y=seed_y (between rows).
+    Visualize a hetero NeighborLoader batch with seeds centered between rows.
+    The seed firm is drawn slightly ABOVE the seed event so they don't overlap.
 
     Parameters
     ----------
-    batch : PyG HeteroData (mini-batch from NeighborLoader)
+    batch : PyG HeteroData mini-batch
     seed_y : float, default 0.5
-        Y-position for seed nodes (between event and firm rows).
+        Base Y-position for the seed event(s).
+    seed_gap : float, default 0.12
+        Vertical offset added to seed firm(s) relative to seed_y.
     save_png : str or None
         Optional path to save the PNG figure.
     save_graphml : str or None
-        Optional path to export GraphML for Gephi; node keys are stringified.
+        Optional path to export a GraphML for Gephi.
     """
     G = nx.DiGraph()
 
-    # --- seeds ---
+    # --- discover seeds ---
     bsz = int(getattr(batch['event'], 'batch_size', 1))
-    seed_event_idx = list(range(bsz))  # local indices within batch['event']
-    # find seed firm(s) by checking both directions present in the batch
+    seed_event_idx = set(range(bsz))
+
     seed_firm_idx = set()
     # firm -> event
     e = batch.edge_index_dict.get(('firm','has','event'))
@@ -50,7 +49,7 @@ def visualize_batch_centered(batch, seed_y=0.5, save_png=None, save_graphml=None
         for se in seed_event_idx:
             seed_firm_idx.update(map(int, dst[src == se]))
 
-    # --- add nodes with attributes ---
+    # --- add nodes ---
     event_times = batch['event'].time.cpu().numpy() if hasattr(batch['event'], 'time') else None
     event_nids  = batch['event'].n_id.cpu().numpy() if hasattr(batch['event'], 'n_id') else np.arange(batch['event'].num_nodes)
     firm_nids   = batch['firm'].n_id.cpu().numpy()  if hasattr(batch['firm'], 'n_id')  else np.arange(batch['firm'].num_nodes)
@@ -60,15 +59,15 @@ def visualize_batch_centered(batch, seed_y=0.5, save_png=None, save_graphml=None
                    type='event',
                    global_id=int(event_nids[i]),
                    time=(int(event_times[i]) if event_times is not None else None),
-                   seed=bool(i in seed_event_idx))
+                   seed=(i in seed_event_idx))
 
     for i in range(batch['firm'].num_nodes):
         G.add_node(('firm', i),
                    type='firm',
                    global_id=int(firm_nids[i]),
-                   seed=bool(i in seed_firm_idx))
+                   seed=(i in seed_firm_idx))
 
-    # --- add edges with relation attribute ---
+    # --- add edges ---
     for (src_t, rel, dst_t), eidx in batch.edge_index_dict.items():
         if eidx is None or eidx.numel() == 0:
             continue
@@ -81,8 +80,7 @@ def visualize_batch_centered(batch, seed_y=0.5, save_png=None, save_graphml=None
         print("Empty graph")
         return None
 
-    # --- compute positions ---
-    # Events: x by time rank (or index), y=0 (seed later moved to seed_y)
+    # --- positions ---
     pos = {}
     if event_times is not None:
         u_times = np.unique(event_times)
@@ -90,59 +88,48 @@ def visualize_batch_centered(batch, seed_y=0.5, save_png=None, save_graphml=None
     else:
         t2x = None
 
-    # Events
+    # events
     for n in G.nodes:
         if G.nodes[n]['type'] == 'event':
-            if t2x is not None:
-                x = float(t2x[G.nodes[n]['time']])
-            else:
-                x = float(n[1])
-            y = 0.0 if not G.nodes[n]['seed'] else float(seed_y)
+            x = float(t2x[G.nodes[n]['time']]) if t2x is not None else float(n[1])
+            y = float(seed_y) if G.nodes[n]['seed'] else 0.0
             pos[n] = np.array([x, y], dtype=float)
 
-    # Firms
-    firm_nodes = [n for n in G.nodes if G.nodes[n]['type'] == 'firm']
+    # firms
+    firm_nodes = [n for n in G.nodes if G.nodes[n]['type']=='firm']
     for idx, n in enumerate(firm_nodes):
-        # x = mean of adjacent events' x (predecessors + successors), else index
         nbr_events = [m for m in G.predecessors(n) if G.nodes[m]['type']=='event'] + \
-                     [m for m in G.successors(n) if G.nodes[m]['type']=='event']
+                     [m for m in G.successors(n)   if G.nodes[m]['type']=='event']
         xs = [pos[m][0] for m in nbr_events if m in pos]
         x = float(np.mean(xs)) if xs else float(idx)
-        y = 1.0 if not G.nodes[n]['seed'] else float(seed_y)
+        y = (seed_y + seed_gap) if G.nodes[n]['seed'] else 1.0
         pos[n] = np.array([x, y], dtype=float)
 
     # --- draw ---
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    # nodes
     ev_nodes = [n for n in G.nodes if G.nodes[n]['type']=='event' and not G.nodes[n]['seed']]
-    ev_seed  = [n for n in G.nodes if G.nodes[n]['type']=='event' and G.nodes[n]['seed']]
     fm_nodes = [n for n in G.nodes if G.nodes[n]['type']=='firm'  and not G.nodes[n]['seed']]
+    ev_seed  = [n for n in G.nodes if G.nodes[n]['type']=='event' and G.nodes[n]['seed']]
     fm_seed  = [n for n in G.nodes if G.nodes[n]['type']=='firm'  and G.nodes[n]['seed']]
 
-    # draw nodes (no colors set; seed nodes larger)
     if fm_nodes:
         nx.draw_networkx_nodes(G, pos, nodelist=fm_nodes, node_shape='s', node_size=200, ax=ax)
     if ev_nodes:
         nx.draw_networkx_nodes(G, pos, nodelist=ev_nodes, node_shape='o', node_size=120, ax=ax)
     if fm_seed:
-        nx.draw_networkx_nodes(G, pos, nodelist=fm_seed, node_shape='s', node_size=350, ax=ax)
+        nx.draw_networkx_nodes(G, pos, nodelist=fm_seed, node_shape='s', node_size=360, ax=ax)
     if ev_seed:
         nx.draw_networkx_nodes(G, pos, nodelist=ev_seed, node_shape='o', node_size=300, ax=ax)
 
-    # edges by relation with different linestyles
-    rel_styles = {
-        'has': 'solid',
-        'of': 'dashed',
-        'similar': 'dashdot',
-        'past_of': 'dotted',
-    }
+    # edges with different linestyles per relation
+    rel_styles = {'has':'solid', 'of':'dashed', 'similar':'dashdot', 'past_of':'dotted'}
     edge_attrs = nx.get_edge_attributes(G, 'rel')
     for rel in sorted(set(edge_attrs.values())):
         es = [(u, v) for (u, v), r in edge_attrs.items() if r == rel]
-        nx.draw_networkx_edges(G, pos, edgelist=es, style=rel_styles.get(rel, 'solid'), alpha=0.8, ax=ax)
+        nx.draw_networkx_edges(G, pos, edgelist=es, style=rel_styles.get(rel, 'solid'), alpha=0.85, ax=ax)
 
-    # minimal labels for seeds
+    # labels for seeds
     labels = {}
     for n in ev_seed:
         t = G.nodes[n].get('time', None)
@@ -153,7 +140,7 @@ def visualize_batch_centered(batch, seed_y=0.5, save_png=None, save_graphml=None
         nx.draw_networkx_labels(G, pos, labels=labels, font_size=9, ax=ax)
 
     ax.set_axis_off()
-    ax.set_title("Batch subgraph with seed nodes centered between rows")
+    ax.set_title("Batch subgraph with seed event and seed firm centered (firm slightly above)")
     fig.tight_layout()
 
     if save_png:
