@@ -1,11 +1,4 @@
-# Updated visualization: place seed firm slightly above seed event (no overlap)
-# - Events: y=0
-# - Firms : y=1
-# - Seed event(s): y=seed_y
-# - Seed firm(s) : y=seed_y + seed_gap
-#
-# Edge styles only (no colors), seeds labeled.
-
+# Update: add a legend showing edge relation -> line style mapping
 import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,7 +6,8 @@ import matplotlib.pyplot as plt
 def visualize_batch_centered_offset(batch, seed_y=0.5, seed_gap=0.12, save_png=None, save_graphml=None):
     """
     Visualize a hetero NeighborLoader batch with seeds centered between rows.
-    The seed firm is drawn slightly ABOVE the seed event so they don't overlap.
+    The seed firm is drawn slightly ABOVE the seed event so they don't overlap,
+    and a legend indicates which line style corresponds to which edge relation.
 
     Parameters
     ----------
@@ -122,10 +116,11 @@ def visualize_batch_centered_offset(batch, seed_y=0.5, seed_gap=0.12, save_png=N
     if ev_seed:
         nx.draw_networkx_nodes(G, pos, nodelist=ev_seed, node_shape='o', node_size=300, ax=ax)
 
-    # edges with different linestyles per relation
+    # edges by relation with different linestyles
     rel_styles = {'has':'solid', 'of':'dashed', 'similar':'dashdot', 'past_of':'dotted'}
     edge_attrs = nx.get_edge_attributes(G, 'rel')
-    for rel in sorted(set(edge_attrs.values())):
+    present_rels = sorted(set(edge_attrs.values()))
+    for rel in present_rels:
         es = [(u, v) for (u, v), r in edge_attrs.items() if r == rel]
         nx.draw_networkx_edges(G, pos, edgelist=es, style=rel_styles.get(rel, 'solid'), alpha=0.85, ax=ax)
 
@@ -139,8 +134,14 @@ def visualize_batch_centered_offset(batch, seed_y=0.5, seed_gap=0.12, save_png=N
     if labels:
         nx.draw_networkx_labels(G, pos, labels=labels, font_size=9, ax=ax)
 
+    # legend for edge relations (line style only, no colors specified)
+    from matplotlib.lines import Line2D
+    handles = [Line2D([0], [0], linestyle=rel_styles.get(rel, 'solid'), label=rel) for rel in present_rels]
+    if handles:
+        ax.legend(handles=handles, title="Edge type", loc="best", frameon=True)
+
     ax.set_axis_off()
-    ax.set_title("Batch subgraph with seed event and seed firm centered (firm slightly above)")
+    ax.set_title("Batch subgraph with seed event centered and seed firm slightly above")
     fig.tight_layout()
 
     if save_png:
@@ -149,4 +150,4 @@ def visualize_batch_centered_offset(batch, seed_y=0.5, seed_gap=0.12, save_png=N
         H = nx.relabel_nodes(G, lambda n: f"{n[0]}::{n[1]}")
         nx.write_graphml(H, save_graphml)
 
-    return fig, ax, G
+    return fig, ax
