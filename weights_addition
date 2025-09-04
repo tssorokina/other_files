@@ -1,0 +1,37 @@
+import math
+import torch
+from torch_scatter import scatter  # pip install torch-scatter
+
+def attach_recency_weights_e2f(
+    batch, 
+    half_life_days: float = 90.0,
+    edge_type = ('event','of','firm'),
+    event_day_attr: str = 'day_idx',   # int day index on event nodes
+    colname: str = 'w_recency'         # name of the weight column to add
+):
+    """
+    Computes per-firm relative recency weights for ('event','of','firm') edges
+    inside the CURRENT sampled batch graph, and writes them into edge_attr.
+    """
+    e_store = batch[edge_type]
+    src, dst = e_store.edge_index  # src: event indices (local to batch), dst: firm indices
+    # event day for each edge = day of source event node
+    event_day = batch['event'][event_day_attr].to(torch.float32)[src]  # [E]
+    num_firms = batch['firm'].num_nodes
+
+    # For each firm node index (dst), get the maximum event_day among its incident edges
+    max_day_per_firm = scatter(event_day, dst, dim=0, dim_size=num_firms, reduce='max')  # [num_firms]
+    # Relative lag per edge within its firm group
+    rel_lag = (max_day_per_firm[dst] - event_day).clamp_min(0.0)  # [E]
+
+    gamma = math.log(2.0) / float(half_life_days)  # decay coeff from half-life
+    w = torch.exp(-gamma * rel_lag)                # [E]
+
+    # Attach to edge_attr (append as a new column)
+    if e_store.edge_attr is None:
+        e_store.edge_attr = w.unsqueeze(1)
+        e_store._edge_attr_names = [colname]  # optional bookkeeping
+    else:
+        e_store.edge_attr = torch.cat([e_store.edge_attr, w.unsqueeze(1)], dim=1)
+        # (Optional) track column order yourself if you care
+    return w  # handy if you want to use it immediately
