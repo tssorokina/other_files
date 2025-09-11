@@ -1,29 +1,32 @@
-def keep_topk_recent_event_edges(data, edge_type=('event','of','firm'),
-                                 k=5, event_day_attr='day_idx'):
-    """Keep only K most recent ('event'→'firm') edges per firm, in-place."""
-    store = data[edge_type]
-    src, dst = store.edge_index
-    day = data['event'][event_day_attr]          # [num_event_nodes] int day
-    e_day = day[src]                             # [E] day of each edge's event
+def topk_e2f_in_batch(batch, edge_type=('event','of','firm'), k=5, event_day_attr='day_idx'):
+    store = batch[edge_type]
+    s, d = store.edge_index
+    e_day = batch['event'][event_day_attr][s]    # event day per edge
 
-    # Stable two-step sort to get groups (dst) with events sorted by recency:
+    # Sort within batch: per firm d, by e_day desc
     idx1 = torch.argsort(e_day, descending=True, stable=True)
-    src1, dst1 = src[idx1], dst[idx1]
-    idx2 = torch.argsort(dst1, stable=True)
-    src2, dst2 = src1[idx2], dst1[idx2]
-    keep_map = idx1[idx2]                        # mapping back to original edges
+    s1, d1 = s[idx1], d[idx1]
+    idx2 = torch.argsort(d1, stable=True)
+    s2, d2 = s1[idx2], d1[idx2]
+    map_back = idx1[idx2]
 
-    # Compute rank within each firm block:
-    E = src2.numel()
-    num_firms = data['firm'].num_nodes
-    counts = torch.bincount(dst2, minlength=num_firms)              # deg per firm
-    starts = torch.cat([torch.zeros(1, dtype=torch.long, device=src.device),
-                        counts.cumsum(0)[:-1]])                     # start idx per firm
-    pos = torch.arange(E, device=src.device) - starts[dst2]         # 0,1,2,...
+    num_firms = batch['firm'].num_nodes
+    counts = torch.bincount(d2, minlength=num_firms)
+    starts = torch.cat([torch.zeros(1, dtype=torch.long, device=s.device),
+                        counts.cumsum(0)[:-1]])
+    pos = torch.arange(s2.numel(), device=s.device) - starts[d2]
     mask = (pos < k)
 
-    keep_edges = keep_map[mask]
-    store.edge_index = torch.stack([src[keep_edges], dst[keep_edges]], dim=0)
+    keep = map_back[mask]
+    store.edge_index = torch.stack([s[keep], d[keep]], dim=0)
     if store.edge_attr is not None:
-        store.edge_attr = store.edge_attr[keep_edges]
-    return data
+        store.edge_attr = store.edge_attr[keep]
+    return batch
+
+train_loader = NeighborLoader(
+    data,
+    input_nodes=('event', data['event'].train_mask),
+    num_neighbors={('event','of','firm'): [-1],  # get ALL, prune in transform
+                   ('event','past_of','event'): [20, 10]},
+    shuffle=True, batch_size=1024, transform=lambda b: topk_e2f_in_batch(b, k=5)
+)
