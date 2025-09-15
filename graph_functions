@@ -1,0 +1,187 @@
+from __future__ import annotations
+from typing import List, Tuple, Optional
+import pandas as pd
+import numpy as np
+
+# --------------------------------------------------------------------
+# 1) Indexing helpers
+# --------------------------------------------------------------------
+
+def prepare_indices(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    firm_col: str = "firm",
+    date_col: str = "date",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Ensure datetime index on (firm, date) for both dataframes.
+    - df1: events-only dates for a subset of firms.
+    - df2: full cross-section (must include the same dates and firms), and must hold 'bbg_sector'.
+    Returns copies with MultiIndex [(firm, date)], sorted.
+    """
+    out1 = df1.copy()
+    out2 = df2.copy()
+    out1[date_col] = pd.to_datetime(out1[date_col])
+    out2[date_col] = pd.to_datetime(out2[date_col])
+
+    out1 = out1.set_index([firm_col, date_col]).sort_index()
+    out2 = out2.set_index([firm_col, date_col]).sort_index()
+    return out1, out2
+
+
+# --------------------------------------------------------------------
+# 2) Event→firm same-date linkage
+# --------------------------------------------------------------------
+
+def link_events_to_firm_snapshot(
+    df1_idx: pd.DataFrame,
+    df2_idx: pd.DataFrame,
+    *,
+    sector_col: str = "bbg_sector",
+    suffix_df2: str = "_mkt",
+) -> pd.DataFrame:
+    """
+    Left-join df1 (events) with df2 on the SAME (firm, date).
+    Keeps all df1 rows; adds df2 columns (e.g., sector/value/features) where available.
+    """
+    # Align on MultiIndex (firm, date); join preserves df1's index and order
+    merged = df1_idx.join(df2_idx, how="left", rsuffix=suffix_df2)
+    # Optional convenience: bring sector to a consistent name if needed
+    # (If df1 already has a 'bbg_sector', it remains; the df2 one will be 'bbg_sector_mkt' via rsuffix)
+    if sector_col not in merged.columns and f"{sector_col}{suffix_df2}" in merged.columns:
+        merged[sector_col] = merged[f"{sector_col}{suffix_df2}"]
+    return merged
+
+
+# --------------------------------------------------------------------
+# 3) Peer selection (same date, same sector, top-k by corr)
+# --------------------------------------------------------------------
+
+def _topk_corr(
+    base_firm: str,
+    candidates: List[str],
+    corr_df: pd.DataFrame,
+    k: int,
+) -> List[Tuple[str, float]]:
+    """
+    Rank candidate firms by correlation with base_firm using corr_df (firm x firm).
+    Returns list of (peer_firm, corr_value) sorted desc, up to k.
+    Self-firm is excluded if present in candidates.
+    """
+    if base_firm not in corr_df.index:
+        return []
+    s = corr_df.loc[base_firm]
+
+    # Restrict to candidates, drop NaNs, exclude self if slipped in
+    idx = [c for c in candidates if c in s.index and c != base_firm]
+    if not idx:
+        return []
+    ranked = s.reindex(idx).dropna().sort_values(ascending=False)
+    if ranked.empty:
+        return []
+    ranked = ranked.head(k)
+    return list(zip(ranked.index.tolist(), ranked.values.tolist()))
+
+
+def select_sector_peers_for_event(
+    df2_idx: pd.DataFrame,
+    corr_df: pd.DataFrame,
+    event_firm: str,
+    event_date: pd.Timestamp,
+    *,
+    sector_col: str = "bbg_sector",
+    k: int = 10,
+) -> pd.DataFrame:
+    """
+    For a single event (event_firm, event_date):
+      1) read the event firm’s sector from df2 at SAME date;
+      2) list all firms in df2 with that SAME date and SAME sector;
+      3) pick top-k by corr_df[event_firm, peer_firm].
+    Returns DataFrame with columns: ['event_firm','event_date','peer_firm','peer_date','peer_sector','corr'].
+    If df2 is missing the event firm on that date (or sector is missing), returns empty frame.
+    """
+    cols = ["event_firm", "event_date", "peer_firm", "peer_date", "peer_sector", "corr"]
+    empty = pd.DataFrame(columns=cols)
+
+    # 1) sector of the event firm on that date
+    try:
+        row = df2_idx.loc[(event_firm, event_date)]
+    except KeyError:
+        return empty  # no same-date snapshot in df2
+
+    sector = row.get(sector_col, None)
+    if pd.isna(sector):
+        return empty
+
+    # 2) candidates: all firms present in df2 on that date AND same sector
+    try:
+        same_day = df2_idx.xs(event_date, level=1, drop_level=False)  # keep firm/date index
+    except KeyError:
+        return empty
+
+    cand_idx = same_day[same_day[sector_col] == sector].index
+    candidates = sorted({f for f, _d in cand_idx})  # firms only
+
+    # 3) rank by correlation
+    ranked = _topk_corr(event_firm, candidates, corr_df, k)
+    if not ranked:
+        return empty
+
+    peers = []
+    for pf, c in ranked:
+        peers.append({
+            "event_firm": event_firm,
+            "event_date": event_date,
+            "peer_firm": pf,
+            "peer_date": event_date,   # same-date linkage
+            "peer_sector": sector,
+            "corr": float(c),
+        })
+    return pd.DataFrame(peers, columns=cols)
+
+
+# --------------------------------------------------------------------
+# 4) Vectorized driver over all events
+# --------------------------------------------------------------------
+
+def build_links_for_all_events(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    corr_df: pd.DataFrame,
+    *,
+    firm_col: str = "firm",
+    date_col: str = "date",
+    sector_col: str = "bbg_sector",
+    k: int = 10,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    High-level pipeline:
+      - index df1/df2,
+      - link events to firm same-date snapshot,
+      - compute same-sector top-k peers by corr for each event.
+    Returns:
+      event_linked  : df1 rows left-joined with df2 same-date snapshot (on MultiIndex).
+      peer_links    : one row per (event, peer), columns:
+                      ['event_firm','event_date','peer_firm','peer_date','peer_sector','corr'].
+    """
+    df1_idx, df2_idx = prepare_indices(df1, df2, firm_col=firm_col, date_col=date_col)
+
+    # (A) Event→firm linkage table
+    event_linked = link_events_to_firm_snapshot(df1_idx, df2_idx, sector_col=sector_col)
+
+    # (B) Peer set per event
+    records = []
+    # Iterate over df1 index to avoid ambiguity if df1 has duplicates (multiple events same firm/date)
+    for (f, d) in event_linked.index.unique():
+        peers_df = select_sector_peers_for_event(
+            df2_idx=df2_idx, corr_df=corr_df,
+            event_firm=f, event_date=d,
+            sector_col=sector_col, k=k
+        )
+        if not peers_df.empty:
+            records.append(peers_df)
+
+    peer_links = pd.concat(records, ignore_index=True) if records else \
+                 pd.DataFrame(columns=["event_firm","event_date","peer_firm","peer_date","peer_sector","corr"])
+
+    return event_linked, peer_links
