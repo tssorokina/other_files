@@ -1,0 +1,357 @@
+If nuking the edges hardly moves metrics and your GNN grads are tiny, the model is (a) bypassing neighbors and (b) your edges/aggregation don’t carry enough incremental signal. You need to (1) **feed higher-SNR relations**, and (2) **force the network to actually use them**. Here are the few interventions that have moved the needle for exactly this setup; they’re all implementable in PyG without a refactor.
+
+---
+
+# A) Make edges that matter (rebuild the ego-graph)
+
+**A1. Same-firm prev-K event→event edges (time-causal, high SNR)**
+For each event $e_{f,t}$, add directed edges from its last $K$ events $\{e_{f,t-1},\dots\}$ with edge attrs: $\Delta$days, prev P\&L, prev RV, time-of-day. Keep $K\in[3,5]$. You already have firm↔event; materialize the meta-path `event → firm → event` into **event→event** edges so messages don’t die on the firm node.
+
+```python
+# build meta-path event->event edges through firm, restricted to last-K and <= t
+# (pseudo; use your day_idx per event and a per-firm CSR to slice last-K ≤ t)
+```
+
+**A2. Peer **event** similarity (not generic return corr)**
+Connect to prior events of *other firms* within 1y by **event co-movement** (e.g., corr of past event P\&Ls / sign-agreement rate), not rolling daily corr. Top-k per node, with time-decay in edge\_attr. This targets the phenomenon you’re predicting.
+
+**A3. Regime/day node (low variance, big effect)**
+Add a `(day)` or `(regime)` node with VIX, dispersion, liquidity features and an edge `day_τ → event_{*,τ}`. It gives a clean macro channel without diluting event features.
+
+---
+
+# B) Make the model use neighbors (or it never will)
+
+**B1. Center-feature dropout (simple & effective)**
+During training, drop center event features with prob $p\in[0.2,0.5]$ so the model must lean on neighbors. Turn off in eval.
+
+```python
+def center_dropout(batch, p=0.3):
+    B = batch['event'].batch_size
+    mask = (torch.rand(B, device=batch['event'].x.device) < p)
+    batch['event'].x[:B][mask] = 0.0
+    return batch
+```
+
+Attach as `transform=` in your loader (train only).
+
+**B2. Two-tower gating (monitor & regularise the gate)**
+Blend self and neighbor paths with a learnable gate $\alpha$; add a penalty to prevent $\alpha\to1$.
+
+```python
+class SelfNeighborGate(torch.nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.gate = torch.nn.Sequential(
+            torch.nn.Linear(d, d//2), torch.nn.ReLU(),
+            torch.nn.Linear(d//2, 1)
+        )
+    def forward(self, h_self, h_nei):
+        alpha = torch.sigmoid(self.gate(h_self.detach()))  # gate from self, but stop grads
+        h = alpha*h_self + (1-alpha)*h_nei
+        return h, alpha
+
+# add L_reg = λ * mean(alpha) with λ>0 to discourage over-reliance on self
+```
+
+**B3. Laplacian consistency on predictions (only on high-trust edges)**
+Encourage smooth predictions across **event–event** edges (same sector/peer edges). It’s a small term but it forces message passing to matter.
+
+```python
+def laplacian_reg(edge_index, y_hat, weight=None, λ=1e-3):
+    src, dst = edge_index
+    diff = (y_hat[src] - y_hat[dst])**2
+    if weight is not None: diff = diff * weight
+    return λ * diff.mean()
+```
+
+**B4. Remove/attenuate self-loops**
+Default GCN/SAGE adds self-loops that dominate early training. Drop them or down-weight self messages (e.g., multiply self by 0.5) so neighbors have a fighting chance.
+
+---
+
+# C) Decouple propagation from learning (cheap but strong baselines)
+
+**C1. APPNP/Personalized PageRank head (few lines, strong on tabular+graph)**
+Fix a propagation operator; learn only the MLP before and after. Often beats trainable GNN when edges are noisy.
+
+```python
+from torch_geometric.nn import APPNP
+class EventAPPNP(torch.nn.Module):
+    def __init__(self, d_in, d_h=128, K=10, alpha=0.1):
+        super().__init__()
+        self.pre  = torch.nn.Sequential(torch.nn.Linear(d_in, d_h), torch.nn.ReLU(),
+                                        torch.nn.Linear(d_h, d_h))
+        self.prop = APPNP(K=K, alpha=alpha)  # fixed propagation
+        self.post = torch.nn.Sequential(torch.nn.ReLU(), torch.nn.Linear(d_h, 1))
+    def forward(self, x, edge_index):
+        h = self.pre(x)
+        h = self.prop(h, edge_index)
+        return self.post(h).squeeze(-1)
+```
+
+**C2. SIGN (precompute K-hop diffusions; train an MLP)**
+Precompute $X^{(k)}=A^k X$ (or PPR powers) once per snapshot; concatenate into features; train a plain MLP. If SIGN beats your GNN, the issue is trainable aggregation, not the graph.
+
+---
+
+# D) Training procedure that actually shifts weight to neighbors
+
+**D1. Curriculum: neighbor-first → unfreeze self**
+Phase 1: train with center-dropout $p=0.5$ and **freeze** the self tower (or even zero it).
+Phase 2: unfreeze and lower $p$ to 0.2.
+This reliably increases neighbor contribution.
+
+**D2. Layer-wise LR & init**
+Initialize neighbor convs to **larger variance** (e.g., Kaiming with gain 1.5) and set a 3–10× **higher LR** on conv params than on the MLP heads. You tried schedules; also try **freezing** the encoder for a few epochs so gradients must go into convs.
+
+**D3. Loss aligned to selection**
+Use **quantile loss** (e.g., Q0.2/Q0.8) or **Laplace NLL with uncertainty-aware policy**. Evaluate/early-stop on **rank-IC** or bucket P\&L, not only regression loss. If the desk’s policy is sign-thresholded, train with an **asymmetric/tilted Huber** or add a **spike–slab head** to model the ±1 pile (earlier message).
+
+---
+
+# E) Data/normalisation fixes (these often unblock gradients)
+
+* **Per-day cross-sectional standardisation** of panel features (z-score or rank) before the encoder; add a missingness mask channel.
+* **Edge feature scaling:** put similarity in $[-1,1]$, use $\log(1+\Delta)$ for time gaps; LayerNorm on edge MLPs.
+* **Degree control:** cap neighbor counts (top-k, prev-K); too many weak neighbors → oversmoothing → tiny grads.
+* **Direction & time:** make edges strictly past→current; verify with asserts.
+* **BatchNorm** off; use LayerNorm/GraphNorm.
+* **Eval determinism:** full 1-hop, fixed weights; compute loss on seed nodes only.
+
+---
+
+## A minimal “forces-neighbors” template (drop-in)
+
+```python
+from torch_geometric.nn import SAGEConv, HeteroConv
+import torch.nn.functional as F
+
+class EventModel(torch.nn.Module):
+    def __init__(self, d_event, d_h=128):
+        super().__init__()
+        self.self_mlp = torch.nn.Sequential(torch.nn.Linear(d_event, d_h), torch.nn.ReLU(),
+                                            torch.nn.Linear(d_h, d_h))
+        self.nei_conv = HeteroConv({
+            ('event','peer','event'): SAGEConv(d_h, d_h),
+            ('event','prev_of_same_firm','event'): SAGEConv(d_h, d_h),
+        }, aggr='sum')
+        self.norm = torch.nn.LayerNorm(d_h)
+        self.gate = SelfNeighborGate(d_h)
+        self.head = torch.nn.Linear(d_h, 1)
+
+    def forward(self, data):
+        # self path
+        x_e = data['event'].x
+        h_self = self.self_mlp(x_e)
+
+        # neighbor path (start from the same h)
+        x_dict = {'event': h_self.clone()}
+        h_dict = self.nei_conv(x_dict, data.edge_index_dict)
+        h_nei  = h_dict['event']
+        # drop self contribution implicitly by not adding residual from self on nei path
+
+        h, alpha = self.gate(h_self, self.norm(h_nei))
+        out = self.head(F.relu(h)).squeeze(-1)
+        return out, alpha
+```
+
+Training loop tweaks:
+
+* Apply `center_dropout(batch, p=0.3)` on train.
+* Add `L_reg = laplacian_reg(batch[('event','peer','event')].edge_index, y_hat, λ=1e-3) + 1e-3*alpha.mean()`.
+* Use **APPNP** head as a baseline; if it wins, keep it.
+
+---
+
+### If none of the above moves metrics
+
+Be honest: with only price/volume/excess returns and sparse event features, OOS predictability of straddle P\&L is thin. In that case:
+(a) **keep the graph but precompute diffused features (SIGN/APPNP) → MLP**;
+(b) spend effort on **edge quality** (event co-sim, same-firm prev-K) and **macro/regime features**;
+(c) judge on **selection metrics** (rank-IC, bucket returns, short hit-rate), not tiny regression-loss deltas.
+
+If you paste your `HeteroData` schema and one training batch dict, I can wire the exact `HeteroConv` + gating + regularisers to your field names so you can run it today.
+
+
+Here’s a compact, math-first walkthrough of the pieces you’re using—**weighted message passing on a heterogeneous graph**, a **self–neighbor gate** that blends the center path with aggregated neighbor signals, and three **regularizers** that force the model to actually use the graph.
+
+I’ll use your types/relations:
+
+* Node sets: $V_{\text{event}}$, $V_{\text{firm}}$.
+* Relations (directed):
+
+  * $E_{\text{rev\_of}}\subset V_{\text{firm}}\!\times\! V_{\text{event}}$  (firm $\to$ event)
+  * $E_{\text{of}}\subset V_{\text{event}}\!\times\! V_{\text{firm}}$      (event $\to$ firm)
+  * $E_{\text{sim}}\subset V_{\text{firm}}\!\times\! V_{\text{firm}}$       (firm $\to$ firm, similarity)
+
+Let $x_v^{(\text{event})}\in\mathbb{R}^{d_e}$ and $x_u^{(\text{firm})}\in\mathbb{R}^{d_f}$ be input features.
+
+---
+
+# 1) Encoders (self paths)
+
+You first encode node features into a common hidden space $\mathbb{R}^{d}$:
+
+$$
+\begin{aligned}
+h_v^{\text{self}} &= \phi_e\!\left(x_v^{(\text{event})}\right)\in\mathbb{R}^{d},\qquad v\in V_{\text{event}},\\
+g_u^{\text{self}} &= \phi_f\!\left(x_u^{(\text{firm})}\right)\in\mathbb{R}^{d},\qquad u\in V_{\text{firm}},
+\end{aligned}
+$$
+
+where $\phi_e,\phi_f$ are small MLPs (Linear–ReLU–Linear).
+This is the “carry/identity” channel the gate can always rely on.
+
+---
+
+# 2) **WeightedAggConv** (neighbor-only, relation-specific aggregation)
+
+For a relation $r\in\{\text{rev\_of},\text{of},\text{sim}\}$ with edges $(u\!\to\! v)\in E_r$, we pass messages **from source nodes only** (no self-loops) and (optionally) multiply by a **scalar edge weight** $w^{(r)}_{uv}\ge 0$ taken from `edge_attr[:, 0]` (e.g., time-decay, correlation, recency):
+
+$$
+\text{msg}^{(r)}_{u\to v} \;=\; W^{(r)}\, h_u^{\text{src}}, \qquad
+\tilde{\text{msg}}^{(r)}_{u\to v} \;=\; w^{(r)}_{uv}\,\text{msg}^{(r)}_{u\to v},
+$$
+
+$$
+m^{(r)}_v \;=\; \frac{1}{Z_v^{(r)}} \sum_{(u\to v)\in E_r} \tilde{\text{msg}}^{(r)}_{u\to v}.
+$$
+
+* In the code, `aggr='mean'` sets $Z_v^{(r)}=\deg^{(r)}(v)$.
+  If you want **true weight normalization** $Z_v^{(r)}=\sum_{u}w^{(r)}_{uv}$, normalize weights on the fly:
+  $\bar{w}^{(r)}_{uv}=w^{(r)}_{uv}/\sum_{u'} w^{(r)}_{u'v}$ and use $\bar{w}$ instead.
+
+Aggregate **across relations targeting the same type** (PyG `HeteroConv(aggr='sum')`):
+
+$$
+\begin{aligned}
+h_v^{\text{nei}} &= \sum_{r: \; \text{target}(r)=\text{event}} m^{(r)}_v
+\quad &\text{for } v\in V_{\text{event}},\\
+g_u^{\text{nei}} &= \sum_{r: \; \text{target}(r)=\text{firm}}  m^{(r)}_u
+\quad &\text{for } u\in V_{\text{firm}}.
+\end{aligned}
+$$
+
+LayerNorm on $h^{\text{nei}}, g^{\text{nei}}$ stabilizes scales across relations.
+This is a standard **MPNN** with edge weights and multiple relations (cf. GraphSAGE mean aggregator; R-GCN combines relation-specific transforms and sums).
+**Refs:** Gilmer et al. 2017 (MPNN), Hamilton et al. 2017 (GraphSAGE), Schlichtkrull et al. 2018 (R-GCN).
+
+---
+
+# 3) **Self–Neighbor Gate** (mixture between center and neighbors)
+
+For **event** nodes (where you predict), compute a scalar gate $\alpha_v\in(0,1)$ from the *self* embedding (optionally detach its gradient to prevent trivial solutions):
+
+$$
+\alpha_v \;=\; \sigma\!\big(g(h_v^{\text{self}})\big),\qquad
+h_v \;=\; \alpha_v\, h_v^{\text{self}} \;+\; (1-\alpha_v)\, \underbrace{\mathrm{LN}\!\left(h_v^{\text{nei}}\right)}_{\text{neighbors}}.
+$$
+
+* If $\alpha_v\!\approx\!1$, the model ignores neighbors; if $\alpha_v\!\approx\!0$, it relies on messages.
+* This is the graph analogue of **Highway/Residual gating** (carry vs transform) or a tiny **mixture-of-experts** gate.
+  **Refs:** Srivastava et al. 2015 (Highway Networks; gated carry), He et al. 2016 (ResNets; skip paths), Shazeer et al. 2017 (MoE gating).
+
+Prediction on events:
+
+$$
+\hat{y}_v \;=\; w^\top \,\mathrm{ReLU}(h_v) + b, \quad v\in V_{\text{event}}.
+$$
+
+---
+
+# 4) Regularizers (make the graph matter)
+
+### (i) **Laplacian smoothness** on the firm–similarity graph
+
+Encourage nearby firms (by similarity edges) to have similar embeddings:
+
+$$
+\mathcal{L}_{\text{lap}} \;=\; \lambda_{\text{lap}} \sum_{(i\to j)\in E_{\text{sim}}} 
+w^{(\text{sim})}_{ij}\,\big\| g_i - g_j \big\|_2^2
+\;=\; \lambda_{\text{lap}}\,\mathrm{Tr}\!\left(G^\top L\,G\right),
+$$
+
+where $G\in\mathbb{R}^{|V_{\text{firm}}|\times d}$ stacks firm embeddings, $L=D-W$ is the (weighted) graph Laplacian.
+**Refs:** Belkin & Niyogi 2003 (Laplacian eigenmaps), Zhou et al. 2004 (label smoothness), Belkin et al. 2006 (manifold regularization).
+
+### (ii) **Event–firm alignment** along `event −of→ firm`
+
+Tie each event embedding to its firm’s embedding (a homophily/consistency prior across types):
+
+$$
+\mathcal{L}_{\text{align}} \;=\; \lambda_{\text{align}} \sum_{(v\to u)\in E_{\text{of}}}
+\big\| h_v - g_u \big\|_2^2.
+$$
+
+Interpretation: a degenerate **TransE-style** constraint with relation vector $r\approx 0$ (encouraging proximity along that relation) to stabilize learning across types.
+**Refs:** Bordes et al. 2013 (TransE); Schlichtkrull et al. 2018 (R-GCN uses relation-specific transforms; alignment is a simple regularizer variant).
+
+### (iii) **Gate penalty** (discourage “all-self”)
+
+Prevent $\alpha$ from collapsing to 1 (pure self path). The simplest convex penalty:
+
+$$
+\mathcal{L}_{\text{gate}} \;=\; \lambda_{\text{gate}}\;\frac{1}{|\mathcal{B}|}\sum_{v\in\text{seed batch}} \alpha_v.
+$$
+
+Alternatives (stronger): push toward mixing by **entropy** or target-mix penalty
+$\lambda\,\tfrac{1}{|\mathcal{B}|}\sum_v (\alpha_v-\tau)^2$ with $\tau\approx 0.5$ or
+$-\lambda\,\tfrac{1}{|\mathcal{B}|}\sum_v [\alpha_v\log\alpha_v+(1-\alpha_v)\log(1-\alpha_v)]$.
+
+---
+
+# 5) Putting it together (objective)
+
+With any event-level prediction loss $\mathcal{L}_{\text{pred}}$ (Huber, Laplace NLL, quantile, censored variants), trained **on seed event nodes**:
+
+$$
+\boxed{
+\mathcal{L} \;=\; \mathcal{L}_{\text{pred}} 
+\;+\; \mathcal{L}_{\text{lap}} 
+\;+\; \mathcal{L}_{\text{align}} 
+\;+\; \mathcal{L}_{\text{gate}}.
+}
+$$
+
+This composite loss (i) stabilizes heterogeneous training, (ii) raises the value of high-quality **firm–firm** edges, and (iii) **forces** the predictor to mix in neighbor signals instead of collapsing to the self path.
+
+---
+
+## Notes / design choices tied to the formulas
+
+* **Edge weights** $w^{(r)}_{uv}$:
+  Use domain priors—e.g., time-decay on event edges $w=\exp(-\gamma\,\Delta)$, correlation on `firm→firm`, a sector flag multiplier—so the messages carry economically motivated signal.
+
+* **True weight normalization** (optional):
+  If you want $m_v^{(r)}=\sum \pi^{(r)}_{uv} W^{(r)}h_u$ with $\sum_u\pi^{(r)}_{uv}=1$, normalize $w$ per-dst as above (the PyG `mean` gives $\tfrac{1}{\deg} \sum w\,\cdot$, which is fine if weights are already centered).
+
+* **Why neighbor-only conv?**
+  Excluding self-loops ensures the self contribution is **only** via $h^{\text{self}}$ and the gate, making $\alpha$ interpretable and regularizable.
+
+* **Why HeteroConv sum?**
+  Summing $m^{(r)}$ across relations is the standard R-GCN-style combination; it keeps type-specific $W^{(r)}$ while letting each relation contribute.
+
+---
+
+## Key references (for verification)
+
+* **Message passing / edge-aware GNNs:**
+  Gilmer et al., *Neural Message Passing for Quantum Chemistry*, ICML 2017.
+  Hamilton et al., *Inductive Representation Learning on Large Graphs (GraphSAGE)*, NeurIPS 2017.
+  Schlichtkrull et al., *Modeling Relational Data with Graph Convolutional Networks (R-GCN)*, ESWC 2018.
+
+* **Gating / mixture between self and neighbors:**
+  Srivastava et al., *Highway Networks*, arXiv 2015 (gated carry/transform).
+  He et al., *Deep Residual Learning for Image Recognition*, CVPR 2016 (skip connections).
+  Shazeer et al., *Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts*, ICLR 2017 (gating principle).
+
+* **Laplacian smoothness / manifold regularization:**
+  Belkin & Niyogi, *Laplacian Eigenmaps*, Neural Computation 2003.
+  Zhou et al., *Learning with Local and Global Consistency*, NeurIPS 2004.
+  Belkin, Niyogi, Sindhwani, *Manifold Regularization*, JMLR 2006.
+
+* **Alignment along relations / KGE intuition:**
+  Bordes et al., *Translating Embeddings for Modeling Multi-relational Data (TransE)*, NeurIPS 2013.
+
+These cover the theoretical backbone of the formulas you’re implementing. If you want, I can also show the **weight-normalized** variant of `WeightedAggConv` (so $Z_v^{(r)}=\sum w$) as a small code patch to match the exact equation above.
