@@ -73,3 +73,67 @@ class QuantileLoss(nn.Module):
 # model outputs [Q0.2, Q0.8] per sample
 # crit = QuantileLoss(taus=(0.2, 0.8), kappa=0.1, reduction="mean", lambda_non_cross=1e-2)
 # loss = crit(y_pred, y_true)
+
+
+
+
+import math
+import torch
+import torch.nn as nn
+
+class QuantileToScore(nn.Module):
+    """
+    Collapse [Q0.2, Q0.8] -> single scalar score.
+
+    modes:
+      - 'mean'   : mu
+      - 'ce'     : certainty-equivalent mu - kappa*b*sign(mu)   (recommended)
+      - 'sharpe' : mu / (b + eps)
+      - 'bound'  : q20 if mu>=0 else q80
+      - 'prob'   : 2*P(Y>0)-1 under Laplace(mu,b) in [-1,1]
+    """
+    def __init__(self, mode='ce', kappa=0.75, eps=1e-6):
+        super().__init__()
+        assert mode in {'mean','ce','sharpe','bound','prob'}
+        self.mode  = mode
+        self.kappa = float(kappa)
+        self.eps   = float(eps)
+        # constant: 2*ln(2.5) ≈ 1.83258
+        self.register_buffer('two_log_2p5', torch.tensor(2.0*math.log(2.5), dtype=torch.float32))
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        """
+        q: [B, 2] where q[:,0]=Q0.2, q[:,1]=Q0.8 (must satisfy Q0.2 <= Q0.8)
+        returns: [B] score
+        """
+        if q.ndim != 2 or q.size(1) != 2:
+            raise ValueError(f"expected [B,2] for [Q0.2,Q0.8], got {tuple(q.shape)}")
+
+        q20, q80 = q[:, 0], q[:, 1]
+        mu = 0.5*(q20 + q80)
+        spread = (q80 - q20).clamp_min(0.0)
+        b = spread / (self.two_log_2p5 + 1e-12)  # Laplace scale estimate
+
+        if self.mode == 'mean':
+            return mu
+
+        if self.mode == 'ce':
+            # certainty-equivalent: shrink toward 0 by kappa*b
+            return mu - self.kappa * b * torch.sign(mu)
+
+        if self.mode == 'sharpe':
+            return mu / (b + self.eps)
+
+        if self.mode == 'bound':
+            # adverse-side bound as scalar prediction
+            return torch.where(mu >= 0, q20, q80)
+
+        if self.mode == 'prob':
+            # signed probability (in [-1,1]) under Laplace(mu,b)
+            b_safe = b + self.eps
+            pos = mu > 0
+            ppos = torch.empty_like(mu)
+            ppos[pos]  = 1.0 - 0.5*torch.exp(-mu[pos]/b_safe[pos])
+            ppos[~pos] = 0.5*torch.exp( mu[~pos]/b_safe[~pos])
+            return 2.0*ppos - 1.0
+
